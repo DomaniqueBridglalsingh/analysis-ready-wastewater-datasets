@@ -35,6 +35,7 @@ Repository Root/
 ├── hydrostream.ipynb
 ├── README.md
 ├── logo.png
+├── exeter_uni.png
 ├── List of tests kept and categories.xlsx
 └── RAW_DATA_FOLDER.zip
     └── RAW_DATA_FOLDER/
