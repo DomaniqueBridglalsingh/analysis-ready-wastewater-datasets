@@ -42,8 +42,7 @@ Repository Root/
         ├── 2000.csv
         ├── 2001.csv
         ├── ...
-        ├── 2025.csv
-        └── List of tests kept and categories.xlsx
+        └── 2025.csv
 ```
 
 ### What this means
