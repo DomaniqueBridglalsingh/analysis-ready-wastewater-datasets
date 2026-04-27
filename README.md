@@ -1,5 +1,7 @@
 <div align="center">
-  <img src="logo.png" width="120" alt="HydroStream Logo">
+  <img src="logo.png" height="90" align="middle" alt="HydroStream Logo">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="exeter_uni.png" height="80" align="middle" alt="University of Exeter Logo">
 
   # HydroStream
   **EA Water Quality Archive Pipeline**
@@ -12,7 +14,7 @@
 </div>
 
 > **Authors:** Domanique Bridglalsingh, Ahmed Abdalla, Jia Hu, Geyong Min, Xiaohong Li, and Siwei Zheng  
-> **Website:** [www.hydrostar-eu.com](http://www.hydrostar-eu.com)
+> **Websites:** [www.hydrostar-eu.com](http://www.hydrostar-eu.com) | [www.exeter.ac.uk](https://www.exeter.ac.uk)
 
 ---
 
@@ -79,60 +81,47 @@ HydroStream supports three built-in processing modes:
 
 ## How to Use
 
-**1. Directory Setup** Prepare your working directory with the raw data folder:
+**1. Directory Setup** Prepare your working directory. Place the Jupyter Notebook and the categories `.xlsx` file directly inside the raw data folder:
 
     Working Directory/
     └── RAW_DATA_FOLDER/
+        ├── hydrostream.ipynb
+        ├── List of tests kept and categories.xlsx
         ├── 2000.csv
         ├── 2001.csv
         ├── ...
-        ├── 2025.csv
-        └── List of tests kept and categories.xlsx
+        └── 2025.csv
 
-**2. Execution** Create a Jupyter Notebook or download `hydrostream.ipynb` in the same directory as the `RAW_DATA_FOLDER` (which contains both the raw CSV files and the Excel categories file), then run:
+**2. Execution** Open `hydrostream.ipynb` directly from inside the `RAW_DATA_FOLDER`. The notebook is intentionally kept simple and contains two main cells:
 
-    # ============================================================================
-    # USAGE
-    # ============================================================================
-    
-    from pathlib import Path
-    
-    if __name__ == "__main__":
-    
-        # ── SETTINGS (EDIT THESE) ─────────────────────────────────────────
-        RAW_DATA_FOLDER = "./RAW_DATA_FOLDER"   # folder with CSVs + Excel file
-        MODE = "full"                           # "full", "electrochemistry", or "contaminants"
-        # ──────────────────────────────────────────────────────────────────
-    
-        result = hydrostream(
-            input_dir=RAW_DATA_FOLDER,
-            mode=MODE,
-            categories_file=None,   # auto-detected from input_dir
-            years=range(2000, 2026),
-            chunksize=250_000,
-            min_test_count=50,
-            flag_outliers=True,
-            generate_stats=True,
-            generate_qa_report=True,
-            save_log=True,
-        )
-    
-        print("\n" + "─" * 60)
-        print("QUICK SUMMARY")
-        print("─" * 60)
-        print(f"  Final rows : {result['final_rows']:,}")
-        print(f"  Output dir : {result['output_dir']}")
-    
-        print("\n  Rows removed per filter:")
-        for k, v in result["drop_counts"].items():
-            print(f"    {k:<28}: {v:>12,}")
-    
-        print("\n  Files created:")
-        for key in ["csv", "parquet", "statistics", "qa_report", "log"]:
-            if result.get(key):
-                print(f"    • {Path(result[key]).name}")
-    
-        print("─" * 60)
+* **Cell 1:** Contains the core `hydrostream()` function. Run this cell first to load the pipeline.
+* **Cell 2:** Contains the usage script. Edit your settings here (such as the `MODE`), then run it to start processing:
+
+      # ============================================================================
+      # USAGE (Cell 2)
+      # ============================================================================
+      
+      from pathlib import Path
+      
+      if __name__ == "__main__":
+      
+          # ── SETTINGS (EDIT THESE) ─────────────────────────────────────────
+          RAW_DATA_FOLDER = "."                           # points to current folder
+          MODE = "full"                                   # "full", "electrochemistry", or "contaminants"
+          # ──────────────────────────────────────────────────────────────────
+      
+          result = hydrostream(
+              input_dir=RAW_DATA_FOLDER,
+              mode=MODE,
+              categories_file=None,   # auto-detected from current folder
+              years=range(2000, 2026),
+              chunksize=250_000,
+              min_test_count=50,
+              flag_outliers=True,
+              generate_stats=True,
+              generate_qa_report=True,
+              save_log=True,
+          )
 **3. Results** After running the function, a new folder called `EA_processed_output/` will be created automatically in the same working directory containing your processed files.
 
 ---
