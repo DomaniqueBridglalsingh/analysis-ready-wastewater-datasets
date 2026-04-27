@@ -1145,27 +1145,35 @@ Source: Environment Agency (England) Open Water Quality Archive, 2000–2025</p>
 # ============================================================================
 # USAGE
 # ============================================================================
-
 if __name__ == "__main__":
-
     # ── SETTINGS (EDIT THESE) ─────────────────────────────────────────
-    RAW_DATA_FOLDER = "."          # <-- path to your CSV folder
-    MODE            = "full"       # <-- "full", "electrochemistry", or "contaminants"
-    # ──────────────────────────────────────────────────────────────────
 
+    # Path to the folder containing your raw yearly CSV files (2000.csv … 2025.csv).
+    # Use "." if this script is in the same folder as the CSVs, or provide a full path
+    # e.g. RAW_DATA_FOLDER = r"C:\Users\you\Documents\EA_data"
+    RAW_DATA_FOLDER = "."
+
+    # Which subset of data to extract. Choose one of three options:
+    #   "full"             → every water-quality test across all types (~59 M rows)
+    #   "electrochemistry" → dissolved metals, ions, pH, conductivity, temperature
+    #   "contaminants"     → microplastics, PFAS, pesticides, insecticides
+    #                        (requires "List of tests kept and categories.xlsx"
+    #                         to be in RAW_DATA_FOLDER — it is auto-detected)
+    MODE            = "full"
+
+    # ──────────────────────────────────────────────────────────────────
     result = hydrostream(
         input_dir          = RAW_DATA_FOLDER,
         mode               = MODE,
-        categories_file    = None,   # auto-detected from input_dir
-        years              = range(2000, 2026),
-        chunksize          = 250_000,
-        min_test_count     = 50,
-        flag_outliers      = True,
-        generate_stats     = True,
-        generate_qa_report = True,
-        save_log           = True,
+        categories_file    = None,   # auto-detected from input_dir; or provide a path e.g. "categories.xlsx"
+        years              = range(2000, 2026),   # narrow this to process a subset, e.g. range(2015, 2026)
+        chunksize          = 250_000,             # lower (e.g. 100_000) if you run out of RAM
+        min_test_count     = 50,                  # tests with fewer total records are dropped (full mode only)
+        flag_outliers      = True,                # marks extreme values in a separate column without removing them
+        generate_stats     = True,                # saves a descriptive statistics Excel file
+        generate_qa_report = True,                # saves an HTML quality-assurance report
+        save_log           = True,                # saves a full text log of every processing step
     )
-
     print("\n" + "─" * 60)
     print("QUICK SUMMARY")
     print("─" * 60)
