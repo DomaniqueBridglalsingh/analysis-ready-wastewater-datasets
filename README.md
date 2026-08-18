@@ -24,7 +24,7 @@ HydroStream V2 constructs reproducible, analysis-ready water-quality datasets fr
 1. Legacy annual CSV exports covering the historical archive.
 2. Current Water Quality Explorer/API CSV exports used from 13 October 2025 onward.
 
-The pipeline validates every input, adapts both schemas to one internal structure, applies the same documented cleaning rules, and writes a concise scientific dataset together with separate QA and provenance outputs. Raw files are read only and are never rewritten.
+The pipeline validates every input, adapts both schemas to one internal structure, applies the same documented cleaning rules, and writes a concise scientific dataset with optional statistics, QA and processing-log outputs. Raw files are read only and are never rewritten.
 
 HydroStream does not replace the EA Water Quality Explorer. The Explorer provides the source observations; HydroStream provides a transparent and repeatable workflow for integrating, filtering, harmonising and auditing them.
 
@@ -155,7 +155,7 @@ Longitude
 Category (when a categories workbook is used)
 ```
 
-`RecordID`, `SamplingPointCode` and `DeterminandCode` remain available in the standalone provenance output but are not included in the primary scientific dataset.
+`RecordID`, `SamplingPointCode` and `DeterminandCode` are used internally for validation, ordering and source-identity checks, then omitted from the user-facing dataset.
 
 ### Qualified results
 
@@ -190,7 +190,7 @@ The following units are deliberately **not** treated as interchangeable:
 - `FTU` is not converted to `NTU`.
 - `g/kg`, `PSU`, `‰` and `ppt` remain distinct.
 
-Current API verbose labels may still be abbreviated without changing their physical meaning, for example `NEPHELOMETRIC TURBIDITY UNITS` to `NTU`. The exact source label is retained as `raw_unit` in the provenance output.
+Current API verbose labels may still be abbreviated without changing their physical meaning, for example `NEPHELOMETRIC TURBIDITY UNITS` to `NTU`. When the optional statistics workbook is requested, its `Unit_Crosswalk` sheet records the source and canonical labels together with review status and record counts.
 
 ## Cleaning and validation
 
@@ -213,25 +213,19 @@ V2.0.0 performs no outlier flagging or outlier removal and produces no outlier c
 
 ## Generated outputs
 
-All outputs are written to `EA_processed_output_v2/`.
+Outputs are written to `EA_processed_output_v2/`.
 
 | Output | Purpose |
 | :--- | :--- |
 | `EA_clean_..._v2.csv` | Primary analysis-ready dataset. |
 | `EA_clean_..._v2.parquet` | Compressed equivalent of the primary dataset. |
-| `EA_provenance_..._v2.csv` | Standalone scientific rows plus EA/source identifiers and unit provenance. |
-| `EA_stations_v2.csv` | Deterministically selected station metadata. |
-| `EA_metadata_v2.csv` | Primary output data dictionary. |
-| `EA_unit_crosswalk_v2.csv` | Raw and canonical unit labels with review status. |
-| `EA_schema_crosswalk_v2.csv` | Legacy/API field mapping. |
-| `EA_source_summary_v2.csv` | Per-source row totals. |
-| `EA_source_manifest_v2.csv` | File inventory, hashes, schema and date coverage. |
-| `EA_source_identity_dedup_v2.csv` | Repeated source-identity audit. |
-| `EA_raw_integrity_v2.csv` | Before/after raw-file integrity check. |
-| `EA_runtime_provenance_v2.json` | Function, runtime, package and argument provenance. |
 | `EA_statistics_..._v2.xlsx` | Optional descriptive statistics workbook. |
 | `EA_qa_report_..._v2.html` | Optional human-readable QA report. |
 | `EA_processing_log_..._v2.txt` | Optional processing log. |
+
+The CSV and Parquet files are always produced. The other three files are controlled by `generate_stats`, `generate_qa_report` and `save_log`. Setting all three options to `False` leaves only the two clean datasets.
+
+Schema, unit, source-file, hash, raw-integrity and deduplication checks still run. Their concise audit tables are included in the optional statistics workbook and processing log rather than being written as separate sidecar files. After a successful run, HydroStream also removes known obsolete V2 sidecars created by earlier pre-release builds; unrelated files are not touched.
 
 ## Performance
 
@@ -247,10 +241,10 @@ The EA archive is a live dataset, so later downloads can include additions or co
 
 - the frozen raw files;
 - download dates;
-- SHA-256 hashes from `EA_source_manifest_v2.csv`;
+- SHA-256 hashes recorded in the optional statistics workbook (`Source_Manifest`) or processing log;
 - the categories workbook and its hash;
 - the tagged `hydrostream_v2.py` version;
-- `EA_runtime_provenance_v2.json`;
+- the run environment recorded in the optional statistics workbook (`Run_Environment`) or processing log;
 - the exact output files used in the analysis or publication.
 
 ## Data licence and citation

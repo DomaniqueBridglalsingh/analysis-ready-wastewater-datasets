@@ -51,6 +51,9 @@ Notes
   available only for explicitly bounded small runs and focused tests.
 * Dependencies are never installed or changed by this module. Install the
   release requirements from ``requirements-hydrostream-v2.txt`` before running.
+* A successful run publishes only the clean CSV and Parquet plus the optional
+  statistics workbook, QA report and processing log. Detailed checks remain
+  internal and are summarised in the optional workbook/log.
 * ``mode="full"`` means the complete retained HydroStream water-matrix scope;
   it deliberately excludes biological, sediment and other non-water matrices.
 ===============================================================================
@@ -79,7 +82,6 @@ import csv
 import hashlib
 import html
 import io
-import json
 import os
 import platform
 import re
@@ -593,77 +595,59 @@ def _capacity_preflight(output_parent: Path, temp_parent: Path,
     }
 
 
-def _module_record(name: str, module: Any) -> Dict[str, Any]:
-    return {
-        "name": name,
-        "imported_version": str(getattr(module, "__version__", "UNKNOWN")),
-        "module_path": str(getattr(module, "__file__", "UNKNOWN")),
-    }
-
-
-def _runtime_provenance(finalizer: str, duckdb_module: Any,
-                        category_provenance: Optional[Dict[str, Any]],
-                        capacity: Dict[str, Any]) -> Dict[str, Any]:
-    modules = [
-        _module_record("pandas", pd),
-        _module_record("numpy", np),
-        _module_record("pyproj", sys.modules[Transformer.__module__.split(".")[0]]),
-        _module_record("openpyxl", openpyxl),
-        _module_record("chardet", chardet),
-        _module_record("pyarrow", pyarrow),
-    ]
-    if duckdb_module is not None:
-        modules.append(_module_record("duckdb", duckdb_module))
-    else:
-        modules.append({
-            "name": "duckdb",
-            "imported_version": None,
-            "module_path": None,
-            "status": "NOT_INSTALLED",
-        })
-    return {
-        "hydrostream_version": HYDROSTREAM_VERSION,
-        "python": {
-            "version": platform.python_version(),
-            "implementation": platform.python_implementation(),
-            "executable": sys.executable,
-            "platform": sys.platform,
-            "machine": os.uname().machine if hasattr(os, "uname") else "UNKNOWN",
-        },
-        "packages": modules,
-        "finalizer": finalizer,
-        "parquet_engine": "duckdb" if finalizer == "duckdb" else "pyarrow",
-        "production_script": {
-            "path": str(Path(__file__).resolve()),
-            "sha256": _sha256_file(Path(__file__).resolve()),
-        },
-        "category_workbook": category_provenance,
-        "capacity_preflight": capacity,
-    }
-
-
 def _publish_artifact(stage_path: Path, final_path: Path) -> None:
     """Monkeypatchable single-artifact atomic publication seam."""
     os.replace(stage_path, final_path)
 
 
-def _publish_artifacts_transactionally(artifacts: Collection[Tuple[Path, Path]],
-                                       run_dir: Path) -> None:
-    """Publish a complete artifact set, rolling back on any failure."""
+def _publish_artifacts_transactionally(
+    artifacts: Collection[Tuple[Path, Path]],
+    run_dir: Path,
+    obsolete_paths: Collection[Path] = (),
+) -> None:
+    """Publish a complete artifact set and remove known obsolete sidecars.
+
+    Existing outputs and deprecated HydroStream-generated sidecars are first
+    moved into the run workspace. Any publication failure restores them. The
+    backups are deleted only after every requested output has been published.
+    """
     pairs = list(artifacts)
     missing = [str(stage) for stage, _ in pairs if not stage.is_file()]
     if missing:
         raise RuntimeError("Mandatory staged outputs are missing: " + ", ".join(missing))
+    final_destinations = {
+        final.resolve(strict=False) for _, final in pairs
+    }
+    obsolete = []
+    seen_obsolete = set()
+    for path in obsolete_paths:
+        resolved = Path(path).resolve(strict=False)
+        if resolved in final_destinations or resolved in seen_obsolete:
+            continue
+        seen_obsolete.add(resolved)
+        obsolete.append(Path(path))
+
     backup_dir = run_dir / "publication_backups"
     backup_dir.mkdir(exist_ok=False)
     backups: list = []
     published: list = []
+
+    def _backup(path: Path) -> None:
+        if not path.exists() and not path.is_symlink():
+            return
+        if not path.is_file() and not path.is_symlink():
+            raise RuntimeError(
+                f"Expected a generated output file but found another path type: {path}"
+            )
+        backup = backup_dir / f"{len(backups):04d}-{path.name}"
+        os.replace(path, backup)
+        backups.append((backup, path))
+
     try:
         for _, final in pairs:
-            if final.exists():
-                backup = backup_dir / final.name
-                os.replace(final, backup)
-                backups.append((backup, final))
+            _backup(final)
+        for obsolete_path in obsolete:
+            _backup(obsolete_path)
         for stage, final in pairs:
             _publish_artifact(stage, final)
             published.append((final, stage))
@@ -1068,7 +1052,7 @@ def hydrostream(
 
     # ------------------------------------------------------------------
     # Current API verbose unit labels -> legacy-style canonical labels.
-    # Unknown labels are retained and surfaced in the crosswalk output.
+    # Unknown labels are retained and summarised in the optional workbook.
     # ------------------------------------------------------------------
 
     API_UNIT_MAP = {
@@ -1662,9 +1646,8 @@ def hydrostream(
         df["ObservationKey"] = _make_observation_key(df)
         df["SourceIdentity"] = _source_identity(df)
 
-        # Stable streaming schema. These additional provenance/station fields
-        # are used internally and for stations/QA outputs; the main public CSV
-        # is narrower.
+        # Stable streaming schema. These additional validation fields are used
+        # internally and in aggregate QA summaries; the public CSV is narrower.
         cols = [
             "SamplingPointCode", "Sampling Point", "Type", "Date",
             "DeterminandCode", "Test", "result", "ResultQualifier", "Unit",
@@ -2116,7 +2099,8 @@ def hydrostream(
     if not tmp_csv.exists() or total_clean_pre_dedup == 0:
         raise ValueError("No rows survived processing.")
 
-    # Save crosswalk/source metadata now; these do not depend on finalisation.
+    # Retain audit tables in memory for the optional statistics workbook.
+    # They are deliberately not written as separate sidecar files.
     unit_crosswalk_df = pd.DataFrame([
         {
             "source_format": sf,
@@ -2134,36 +2118,6 @@ def hydrostream(
 
     source_df = pd.DataFrame(source_summary)
 
-    out_units = run_dir / "EA_unit_crosswalk_v2.csv"
-    out_sources = run_dir / "EA_source_summary_v2.csv"
-    out_schema = run_dir / "EA_schema_crosswalk_v2.csv"
-    out_metadata = run_dir / "EA_metadata_v2.csv"
-    out_stations = run_dir / "EA_stations_v2.csv"
-    out_manifest = run_dir / "EA_source_manifest_v2.csv"
-    out_dedup_audit = run_dir / "EA_source_identity_dedup_v2.csv"
-
-    unit_crosswalk_df.to_csv(out_units, index=False)
-    source_df.to_csv(out_sources, index=False)
-    source_manifest.to_csv(out_manifest, index=False)
-    if using_duckdb:
-        dedup_sql = str(out_dedup_audit).replace("'", "''")
-        con.execute(
-            "COPY (SELECT *, CASE WHEN payload_variants=1 THEN "
-            "'equivalent_same_source_record' ELSE 'CONFLICT' END AS reason "
-            "FROM source_identity_groups ORDER BY SourceIdentity) "
-            f"TO '{dedup_sql}' (FORMAT CSV, HEADER true)"
-        )
-    else:
-        dedup_frame = source_identity_groups_df.copy()
-        dedup_frame["reason"] = np.where(
-            dedup_frame["payload_variants"].eq(1),
-            "equivalent_same_source_record",
-            "CONFLICT",
-        )
-        dedup_frame.sort_values("SourceIdentity").to_csv(
-            out_dedup_audit, index=False
-        )
-
     schema_crosswalk = pd.DataFrame([
         ("Sampling point code", "sample.samplingPoint.notation", "samplingPoint.notation", "SamplingPointCode"),
         ("Sampling point label", "sample.samplingPoint.label", "samplingPoint.prefLabel", "Sampling Point"),
@@ -2177,20 +2131,18 @@ def hydrostream(
         ("Coordinates", "Easting/Northing", "longitude/latitude", "Longitude/Latitude"),
         ("Record ID", "@id", "id", "internal provenance"),
         ("Sample ID", "parsed from @id", "parsed from id", "internal de-duplication"),
-        ("Region", "not supplied", "samplingPoint.region", "stations metadata"),
-        ("Area", "not supplied", "samplingPoint.area", "stations metadata"),
-        ("Sub-area", "not supplied", "samplingPoint.subArea", "stations metadata"),
+        ("Region", "not supplied", "samplingPoint.region", "internal validation"),
+        ("Area", "not supplied", "samplingPoint.area", "internal validation"),
+        ("Sub-area", "not supplied", "samplingPoint.subArea", "internal validation"),
     ], columns=["concept", "legacy_field", "api_field", "v2_field"])
-    schema_crosswalk.to_csv(out_schema, index=False)
 
     # ==================================================================
     # FINALISATION — DUCKDB WHEN AVAILABLE, PANDAS FALLBACK OTHERWISE
     # ==================================================================
 
     # The primary scientific dataset is intentionally concise. Source and EA
-    # identifiers remain available in the standalone provenance output and are
-    # still used internally for validation, deterministic ordering and safe
-    # source-identity deduplication.
+    # identifiers are used internally for validation, deterministic ordering
+    # and safe source-identity deduplication, then omitted from public output.
     main_columns = [
         "Sampling Point", "Type", "Date", "Test", "result",
         "ResultQualifier", "Unit", "Season", "SourceYear",
@@ -2198,46 +2150,6 @@ def hydrostream(
     ]
     if category_map:
         main_columns.append("Category")
-
-    provenance_columns = [
-        "RecordID", "SamplingPointCode", "DeterminandCode",
-        "Sampling Point", "Type", "Date", "Test", "result",
-        "ResultQualifier", "Unit", "Season", "SourceYear",
-        "Latitude", "Longitude", "SourceFormat", "SourceFile",
-        "SourceRecordID", "SampleID", "ObservationKey", "RawUnit",
-        "UnitPolicyStatus", "UnitConversionCode", "SourceIdentity",
-        "SourceCopyCount", "EquivalentSourceFiles",
-    ]
-    if category_map:
-        provenance_columns.insert(14, "Category")
-    provenance_aliases = {
-        "RecordID": "record_id",
-        "SamplingPointCode": "sampling_point_code",
-        "DeterminandCode": "determinand_code",
-        "Sampling Point": "sampling_point",
-        "Type": "type",
-        "Date": "date",
-        "Test": "test",
-        "result": "result",
-        "ResultQualifier": "result_qualifier",
-        "Unit": "unit",
-        "Season": "season",
-        "SourceYear": "source_year",
-        "Latitude": "latitude",
-        "Longitude": "longitude",
-        "Category": "category",
-        "SourceFormat": "source_format",
-        "SourceFile": "source_file",
-        "SourceRecordID": "source_record_id",
-        "SampleID": "sample_id",
-        "ObservationKey": "observation_key",
-        "RawUnit": "raw_unit",
-        "UnitPolicyStatus": "unit_policy_status",
-        "UnitConversionCode": "unit_conversion_code",
-        "SourceIdentity": "source_identity",
-        "SourceCopyCount": "source_copy_count",
-        "EquivalentSourceFiles": "equivalent_source_files",
-    }
 
     final_df: Any = None
 
@@ -2309,19 +2221,13 @@ def hydrostream(
         end_year = pd.Timestamp(date_max).year
         out_csv = run_dir / f"EA_clean_{start_year}_{end_year}_{mode}_v2.csv"
         out_pq = run_dir / f"EA_clean_{start_year}_{end_year}_{mode}_v2.parquet"
-        out_provenance = run_dir / f"EA_provenance_{start_year}_{end_year}_{mode}_v2.csv"
 
         quoted = ", ".join(f'"{c}"' for c in main_columns)
-        provenance_quoted = ", ".join(
-            f'"{column}" AS "{provenance_aliases[column]}"'
-            for column in provenance_columns
-        )
         order_sql = ", ".join(
             f'"{column}" NULLS LAST' for column in FINAL_ORDER_COLUMNS + ["RecordID"]
         )
         out_csv_sql = str(out_csv).replace("'", "''")
         out_pq_sql = str(out_pq).replace("'", "''")
-        out_provenance_sql = str(out_provenance).replace("'", "''")
 
         con.execute(
             f'COPY (SELECT {quoted} FROM final_internal ORDER BY {order_sql}) '
@@ -2331,65 +2237,6 @@ def hydrostream(
             f'COPY (SELECT {quoted} FROM final_internal ORDER BY {order_sql}) '
             f"TO '{out_pq_sql}' (FORMAT PARQUET, COMPRESSION ZSTD)"
         )
-        con.execute(
-            f'COPY (SELECT {provenance_quoted} FROM final_internal '
-            f'ORDER BY {order_sql}) TO \'{out_provenance_sql}\' '
-            "(FORMAT CSV, HEADER true)"
-        )
-
-        # Deterministic station ranking: valid coordinates, completeness, API,
-        # recency, then stable provenance. Coordinate variants remain visible.
-        out_stations_sql = str(out_stations).replace("'", "''")
-        con.execute(f"""
-            COPY (
-                WITH scored AS (
-                    SELECT *,
-                           coalesce(nullif(trim(SamplingPointCode), ''),
-                                    nullif(trim("Sampling Point"), ''), RecordID)
-                               AS station_key,
-                           CASE WHEN Latitude IS NOT NULL AND Longitude IS NOT NULL
-                                THEN 1 ELSE 0 END AS valid_coordinates,
-                           (CASE WHEN "Sampling Point" IS NOT NULL THEN 1 ELSE 0 END +
-                            CASE WHEN Region IS NOT NULL THEN 1 ELSE 0 END +
-                            CASE WHEN Area IS NOT NULL THEN 1 ELSE 0 END +
-                            CASE WHEN SubArea IS NOT NULL THEN 1 ELSE 0 END +
-                            CASE WHEN SamplingPointStatus IS NOT NULL THEN 1 ELSE 0 END +
-                            CASE WHEN SamplingPointType IS NOT NULL THEN 1 ELSE 0 END)
-                               AS metadata_completeness
-                    FROM final_internal
-                ), station_stats AS (
-                    SELECT station_key, count(*) AS candidate_record_count,
-                           count(DISTINCT CASE WHEN valid_coordinates=1 THEN
-                               concat(CAST(Latitude AS VARCHAR), '|',
-                                      CAST(Longitude AS VARCHAR)) END)
-                               AS coordinate_variant_count
-                    FROM scored GROUP BY station_key
-                ), ranked AS (
-                    SELECT *, row_number() OVER (
-                        PARTITION BY station_key
-                        ORDER BY valid_coordinates DESC,
-                                 metadata_completeness DESC,
-                                 CASE WHEN SourceFormat='api' THEN 0 ELSE 1 END,
-                                 Date DESC NULLS LAST, SourceFormat,
-                                 SourceRecordID, RecordID
-                    ) AS station_rank
-                    FROM scored
-                )
-                SELECT r.SamplingPointCode, r."Sampling Point", r.Latitude,
-                       r.Longitude, r.Region, r.Area, r.SubArea,
-                       r.SamplingPointStatus, r.SamplingPointType,
-                       r.RecordID AS SelectedRecordID,
-                       r.SourceFormat AS SelectedSourceFormat,
-                       r.SourceFile AS SelectedSourceFile,
-                       r.SourceRecordID AS SelectedSourceRecordID,
-                       r.valid_coordinates, r.metadata_completeness,
-                       s.candidate_record_count, s.coordinate_variant_count
-                FROM ranked r JOIN station_stats s USING (station_key)
-                WHERE r.station_rank=1
-                ORDER BY r.SamplingPointCode NULLS LAST,
-                         r."Sampling Point" NULLS LAST, r.RecordID
-            ) TO '{out_stations_sql}' (FORMAT CSV, HEADER true)
-        """)
 
         # Summary queries.
         unique_sites = int(con.execute(
@@ -2496,70 +2343,12 @@ def hydrostream(
         end_year = int(pd.Timestamp(date_max).year)
         out_csv = run_dir / f"EA_clean_{start_year}_{end_year}_{mode}_v2.csv"
         out_pq = run_dir / f"EA_clean_{start_year}_{end_year}_{mode}_v2.parquet"
-        out_provenance = run_dir / f"EA_provenance_{start_year}_{end_year}_{mode}_v2.csv"
 
         final_df = df_all.copy()
         final_df[main_columns].to_csv(out_csv, index=False)
         final_df[main_columns].to_parquet(
             out_pq, index=False, compression="zstd", engine="pyarrow"
         )
-        final_df[provenance_columns].rename(
-            columns=provenance_aliases
-        ).to_csv(out_provenance, index=False)
-
-        station_sort = final_df.copy()
-        station_sort["_station_key"] = (
-            station_sort["SamplingPointCode"].astype("string")
-            .fillna(station_sort["Sampling Point"].astype("string"))
-            .fillna(station_sort["RecordID"].astype("string"))
-        )
-        station_sort["valid_coordinates"] = (
-            station_sort["Latitude"].notna() & station_sort["Longitude"].notna()
-        )
-        metadata_fields = [
-            "Sampling Point", "Region", "Area", "SubArea",
-            "SamplingPointStatus", "SamplingPointType",
-        ]
-        station_sort["metadata_completeness"] = station_sort[
-            metadata_fields
-        ].notna().sum(axis=1)
-        station_sort["_api_priority"] = np.where(
-            station_sort["SourceFormat"].eq("api"), 0, 1
-        )
-        station_sort["candidate_record_count"] = station_sort.groupby(
-            "_station_key"
-        )["RecordID"].transform("size")
-        coordinate_key = (
-            station_sort["Latitude"].astype("string") + "|" +
-            station_sort["Longitude"].astype("string")
-        ).where(station_sort["valid_coordinates"])
-        station_sort["coordinate_variant_count"] = coordinate_key.groupby(
-            station_sort["_station_key"]
-        ).transform("nunique").fillna(0).astype("Int64")
-        station_sort = station_sort.sort_values(
-            ["_station_key", "valid_coordinates", "metadata_completeness",
-             "_api_priority", "Date", "SourceFormat", "SourceRecordID", "RecordID"],
-            ascending=[True, False, False, True, False, True, True, True],
-            kind="mergesort",
-            na_position="last",
-        )
-        stations_df = station_sort.drop_duplicates("_station_key", keep="first")[[
-            "SamplingPointCode", "Sampling Point", "Latitude", "Longitude",
-            "Region", "Area", "SubArea", "SamplingPointStatus",
-            "SamplingPointType", "RecordID", "SourceFormat", "SourceFile",
-            "SourceRecordID", "valid_coordinates", "metadata_completeness",
-            "candidate_record_count", "coordinate_variant_count",
-        ]]
-        stations_df = stations_df.rename(columns={
-            "RecordID": "SelectedRecordID",
-            "SourceFormat": "SelectedSourceFormat",
-            "SourceFile": "SelectedSourceFile",
-            "SourceRecordID": "SelectedSourceRecordID",
-        }).sort_values(
-            ["SamplingPointCode", "Sampling Point", "SelectedRecordID"],
-            kind="mergesort", na_position="last",
-        )
-        stations_df.to_csv(out_stations, index=False)
 
         unique_sites = int(final_df["SamplingPointCode"].nunique(dropna=True))
         unique_tests = int(final_df["Test"].nunique(dropna=True))
@@ -2577,29 +2366,97 @@ def hydrostream(
         )
 
     # ==================================================================
-    # METADATA FILE
+    # END-OF-RUN INPUT INTEGRITY (VALIDATED INTERNALLY, NOT A SIDECAR FILE)
     # ==================================================================
 
-    metadata_rows = [
-        ("Sampling Point", "string", "EA sampling-point label supplied by the relevant source record."),
-        ("Type", "string", "Sample material/water matrix retained by HydroStream."),
+    integrity_rows = []
+    for row in source_manifest.loc[
+        source_manifest["accepted"].fillna(False)
+    ].itertuples():
+        source_path = Path(row.source_path)
+        after_size = int(source_path.stat().st_size)
+        after_sha256 = _sha256_file(source_path)
+        size_match = after_size == int(row.file_size_bytes)
+        sha256_match = after_sha256 == str(row.sha256)
+        integrity_rows.append({
+            "source_format": row.source_format,
+            "source_filename": row.source_filename,
+            "before_size_bytes": int(row.file_size_bytes),
+            "after_size_bytes": after_size,
+            "before_sha256": row.sha256,
+            "after_sha256": after_sha256,
+            "size_match": size_match,
+            "sha256_match": sha256_match,
+            "status": "PASS" if size_match and sha256_match else "FAIL",
+        })
+    raw_integrity_df = pd.DataFrame(integrity_rows)
+    changed_sources = raw_integrity_df.loc[raw_integrity_df["status"].eq("FAIL")]
+    if not changed_sources.empty:
+        raise RuntimeError(
+            "Raw source changed during the run; publication aborted: "
+            + ", ".join(changed_sources["source_filename"].astype(str))
+        )
+
+    if cat_path is not None and category_provenance is not None:
+        category_after_size = int(cat_path.stat().st_size)
+        category_after_sha256 = _sha256_file(cat_path)
+        category_provenance["after_file_size_bytes"] = category_after_size
+        category_provenance["after_sha256"] = category_after_sha256
+        category_provenance["unchanged_during_run"] = bool(
+            category_after_size == category_provenance["file_size_bytes"]
+            and category_after_sha256 == category_provenance["sha256"]
+        )
+        if not category_provenance["unchanged_during_run"]:
+            raise RuntimeError(
+                "Category workbook changed during the run; publication aborted: "
+                f"{cat_path}"
+            )
+
+    output_schema_rows = [
+        ("Sampling Point", "string", "EA sampling-point label."),
+        ("Type", "string", "Retained sample material/water matrix."),
         ("Date", "datetime", "Observation/sample timestamp."),
-        ("Test", "string", "Canonical analyte name: legacy determinand.definition or current API determinand.prefLabel."),
-        ("result", "float", "Numeric reported value or numeric reporting limit; interpret with ResultQualifier."),
-        ("ResultQualifier", "string", "Qualifier such as <, <=, > or >=. Blank for unqualified numeric results."),
-        ("Unit", "string", "Canonical unit where a reviewed rule exists; otherwise the unreviewed raw label is retained and identified in provenance."),
-        ("Season", "string", "Winter, Spring, Summer or Autumn derived from Date."),
+        ("Test", "string", "Canonical analyte name."),
+        ("result", "float", "Numeric value or reporting limit; interpret with ResultQualifier."),
+        ("ResultQualifier", "string", "Qualifier such as <, <=, > or >=; blank when unqualified."),
+        ("Unit", "string", "Reviewed canonical label or preserved source unit where no conversion applies."),
+        ("Season", "string", "Season derived from Date."),
         ("SourceYear", "integer", "Calendar year derived from Date."),
-        ("Latitude", "float", "EPSG:4326 latitude. Legacy BNG coordinates converted; API latitude used directly."),
-        ("Longitude", "float", "EPSG:4326 longitude. Legacy BNG coordinates converted; API longitude used directly."),
+        ("Latitude", "float", "EPSG:4326 latitude."),
+        ("Longitude", "float", "EPSG:4326 longitude."),
     ]
     if category_map:
-        metadata_rows.append(
-            ("Category", "string", "Category from the curated test-category workbook; otherwise uncategorized.")
+        output_schema_rows.append(
+            ("Category", "string", "Reviewed category from the optional workbook.")
         )
-    pd.DataFrame(metadata_rows, columns=["variable", "type", "description"]).to_csv(
-        out_metadata, index=False
+    output_schema_df = pd.DataFrame(
+        output_schema_rows, columns=["variable", "type", "description"]
     )
+
+    dedup_summary = pd.DataFrame([
+        ("Identity basis", "SourceFormat + SourceRecordID"),
+        ("Repeated source-identity groups", duplicate_identity_groups),
+        ("Equivalent rows removed", int(duplicates_removed)),
+        ("Conflicting identity groups", 0),
+        ("Observation-key deletion used", False),
+    ], columns=["Metric", "Value"])
+
+    runtime_summary = pd.DataFrame([
+        ("HydroStream version", HYDROSTREAM_VERSION),
+        ("Started UTC", started_utc.isoformat()),
+        ("Python", platform.python_version()),
+        ("Platform", sys.platform),
+        ("Finalizer", selected_finalizer),
+        ("Pandas", getattr(pd, "__version__", "UNKNOWN")),
+        ("NumPy", getattr(np, "__version__", "UNKNOWN")),
+        ("PyArrow", getattr(pyarrow, "__version__", "UNKNOWN")),
+        ("DuckDB", getattr(duckdb, "__version__", "NOT INSTALLED")),
+        ("Mode", mode),
+        ("Years", f"{min(year_set)}-{max(year_set)}"),
+        ("Cutover date", str(cutover.date())),
+        ("Chunk size", int(chunksize)),
+        ("Minimum test count", int(min_test_count)),
+    ], columns=["Item", "Value"])
 
     # ==================================================================
     # STATISTICS
@@ -2702,8 +2559,13 @@ def hydrostream(
                 rows_per_year.to_excel(writer, sheet_name="Rows_Per_Year", index=False)
                 drop_audit.to_excel(writer, sheet_name="QA_Drop_Audit", index=False)
                 source_df.to_excel(writer, sheet_name="Source_Files", index=False)
+                source_manifest.to_excel(writer, sheet_name="Source_Manifest", index=False)
+                raw_integrity_df.to_excel(writer, sheet_name="Raw_Integrity", index=False)
+                dedup_summary.to_excel(writer, sheet_name="Dedup_Summary", index=False)
                 unit_crosswalk_df.to_excel(writer, sheet_name="Unit_Crosswalk", index=False)
                 schema_crosswalk.to_excel(writer, sheet_name="Schema_Crosswalk", index=False)
+                output_schema_df.to_excel(writer, sheet_name="Output_Schema", index=False)
+                runtime_summary.to_excel(writer, sheet_name="Run_Environment", index=False)
                 if category_stats is not None:
                     category_stats.to_excel(writer, sheet_name="Rows_Per_Category", index=False)
 
@@ -2787,14 +2649,15 @@ th{{background:#f1f5f2}}.note{{background:#f6f8f7;padding:12px;border-left:4px s
 <tr><td>Unique units</td><td>{unique_units:,}</td></tr>
 <tr><td>Rows with coordinates</td><td>{coordinate_count:,} ({coordinate_count/final_rows*100:.2f}%)</td></tr>
 <tr><td>Rows with qualifiers</td><td>{qualifier_count:,} ({qualifier_count/final_rows*100:.2f}%)</td></tr>
+<tr><td>Raw source files unchanged</td><td>{int(raw_integrity_df['status'].eq('PASS').sum())}/{len(raw_integrity_df)}</td></tr>
 <tr><td>Duplicates removed</td><td>{duplicates_removed:,}</td></tr></table>
 
 <h2>Legacy/API integration</h2>
 <div class="note"><b>Transition recovery validation for these exact run
 inputs: NOT TESTED.</b> The configured source boundary is still applied as
 legacy strictly before {cutover.date()} and API from {cutover.date()} onward.
-Use the provenance-linked focused transition audit before making a numerical
-recovery claim for a source snapshot.</div>
+Use a focused transition audit before making a numerical recovery claim for a
+source snapshot.</div>
 <table><tr><th>Check</th><th>Count</th></tr>
 <tr><td>Legacy rows excluded at/after cutover</td><td>{integration_counts['legacy_rows_excluded_at_cutover']:,}</td></tr>
 <tr><td>API rows found before cutover</td><td>{integration_counts['api_rows_before_cutover']:,}</td></tr>
@@ -2820,102 +2683,31 @@ recovery claim for a source snapshot.</div>
             ) from exc
 
     # ==================================================================
-    # PROVENANCE, END-OF-RUN RAW INTEGRITY, AND TRANSACTIONAL PUBLICATION
+    # PROCESSING LOG AND TRANSACTIONAL PUBLICATION
     # ==================================================================
 
-    out_raw_integrity = run_dir / "EA_raw_integrity_v2.csv"
-    integrity_rows = []
-    for row in source_manifest.loc[
-        source_manifest["accepted"].fillna(False)
-    ].itertuples():
-        source_path = Path(row.source_path)
-        after_size = int(source_path.stat().st_size)
-        after_sha256 = _sha256_file(source_path)
-        size_match = after_size == int(row.file_size_bytes)
-        sha256_match = after_sha256 == str(row.sha256)
-        integrity_rows.append({
-            "source_format": row.source_format,
-            "source_filename": row.source_filename,
-            "before_size_bytes": int(row.file_size_bytes),
-            "after_size_bytes": after_size,
-            "before_sha256": row.sha256,
-            "after_sha256": after_sha256,
-            "size_match": size_match,
-            "sha256_match": sha256_match,
-            "status": "PASS" if size_match and sha256_match else "FAIL",
-        })
-    raw_integrity_df = pd.DataFrame(integrity_rows)
-    raw_integrity_df.to_csv(out_raw_integrity, index=False)
-    changed_sources = raw_integrity_df.loc[raw_integrity_df["status"].eq("FAIL")]
-    if not changed_sources.empty:
-        raise RuntimeError(
-            "Raw source changed during the run; publication aborted: "
-            + ", ".join(changed_sources["source_filename"].astype(str))
-        )
-
-    if cat_path is not None and category_provenance is not None:
-        category_after_size = int(cat_path.stat().st_size)
-        category_after_sha256 = _sha256_file(cat_path)
-        category_provenance["after_file_size_bytes"] = category_after_size
-        category_provenance["after_sha256"] = category_after_sha256
-        category_provenance["unchanged_during_run"] = bool(
-            category_after_size == category_provenance["file_size_bytes"]
-            and category_after_sha256 == category_provenance["sha256"]
-        )
-        if not category_provenance["unchanged_during_run"]:
-            raise RuntimeError(
-                "Category workbook changed during the run; publication aborted: "
-                f"{cat_path}"
-            )
-
     finished_utc = datetime.now(timezone.utc)
-    runtime_data = _runtime_provenance(
-        selected_finalizer, duckdb,
-        category_provenance, capacity,
+
+    # Preserve concise reproducibility details inside the optional log instead
+    # of producing separate manifest, integrity and runtime sidecar files.
+    log_buffer.write("\nSOURCE FILE HASHES AND END-OF-RUN INTEGRITY\n")
+    for row in raw_integrity_df.itertuples():
+        log_buffer.write(
+            f"  {row.source_format:<6} {row.source_filename} "
+            f"sha256={row.before_sha256} status={row.status}\n"
+        )
+    log_buffer.write("\nRUNTIME\n")
+    log_buffer.write(f"  Python             : {platform.python_version()}\n")
+    log_buffer.write(f"  Platform           : {sys.platform}\n")
+    log_buffer.write(f"  pandas             : {getattr(pd, '__version__', 'UNKNOWN')}\n")
+    log_buffer.write(f"  numpy              : {getattr(np, '__version__', 'UNKNOWN')}\n")
+    log_buffer.write(f"  pyarrow            : {getattr(pyarrow, '__version__', 'UNKNOWN')}\n")
+    log_buffer.write(
+        f"  duckdb             : {getattr(duckdb, '__version__', 'NOT INSTALLED')}\n"
     )
-    runtime_data.update({
-        "started_utc": started_utc.isoformat(),
-        "finished_utc": finished_utc.isoformat(),
-        "arguments": {
-            "input_dir": str(root),
-            "mode": mode,
-            "years": sorted(year_set),
-            "chunksize": int(chunksize),
-            "min_test_count": int(min_test_count),
-            "generate_stats": bool(generate_stats),
-            "generate_qa_report": bool(generate_qa_report),
-            "save_log": bool(save_log),
-            "cutover_date": str(cutover),
-            "duckdb_memory_limit": str(duckdb_memory_limit),
-            "requested_finalizer": requested_finalizer,
-            "selected_finalizer": selected_finalizer,
-            "unitless_quantitative_allowlist": [
-                [code, test] for code, test in sorted(unitless_allowlist_keys)
-            ],
-            "pandas_fallback_max_rows": int(pandas_fallback_max_rows),
-        },
-        "source_manifest_sha256": _sha256_file(out_manifest),
-        "raw_integrity": {
-            "sources_checked": int(len(raw_integrity_df)),
-            "sources_unchanged": int(raw_integrity_df["status"].eq("PASS").sum()),
-        },
-        "deduplication": {
-            "identity": "SourceFormat + SourceRecordID",
-            "equivalence_check": (
-                "candidate fingerprints followed by null-aware exact comparison "
-                "of canonical scientific/provenance fields"
-            ),
-            "duplicate_identity_groups": duplicate_identity_groups,
-            "equivalent_rows_removed": int(duplicates_removed),
-            "raw_equivalent_duplicate_rows": equivalent_duplicate_rows,
-            "conflicting_identity_groups": 0,
-            "observation_key_deletion": False,
-        },
-    })
-    out_runtime = run_dir / "EA_runtime_provenance_v2.json"
-    out_runtime.write_text(
-        json.dumps(runtime_data, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    log_buffer.write(
+        f"  Raw sources intact : "
+        f"{int(raw_integrity_df['status'].eq('PASS').sum())}/{len(raw_integrity_df)}\n"
     )
 
     completion_lines = [
@@ -2948,11 +2740,7 @@ recovery claim for a source snapshot.</div>
         con.close()
         con = None
 
-    staged_outputs = [
-        out_csv, out_pq, out_provenance, out_stations, out_metadata,
-        out_units, out_schema, out_sources, out_manifest, out_dedup_audit,
-        out_runtime, out_raw_integrity,
-    ]
+    staged_outputs = [out_csv, out_pq]
     if stats_output is not None:
         staged_outputs.append(stats_output)
     if qa_output is not None:
@@ -2963,7 +2751,21 @@ recovery claim for a source snapshot.</div>
     publication_pairs = [
         (stage_path, out_dir / stage_path.name) for stage_path in staged_outputs
     ]
-    _publish_artifacts_transactionally(publication_pairs, run_dir)
+    obsolete_outputs = [
+        out_dir / "EA_stations_v2.csv",
+        out_dir / "EA_metadata_v2.csv",
+        out_dir / "EA_unit_crosswalk_v2.csv",
+        out_dir / "EA_schema_crosswalk_v2.csv",
+        out_dir / "EA_source_summary_v2.csv",
+        out_dir / "EA_source_manifest_v2.csv",
+        out_dir / "EA_source_identity_dedup_v2.csv",
+        out_dir / "EA_raw_integrity_v2.csv",
+        out_dir / "EA_runtime_provenance_v2.json",
+        *sorted(out_dir.glob("EA_provenance_*_v2.csv")),
+    ]
+    _publish_artifacts_transactionally(
+        publication_pairs, run_dir, obsolete_paths=obsolete_outputs
+    )
     final_paths = {
         stage_path.name: final_path for stage_path, final_path in publication_pairs
     }
@@ -2980,16 +2782,6 @@ recovery claim for a source snapshot.</div>
 
     final_csv = final_paths[out_csv.name]
     final_parquet = final_paths[out_pq.name]
-    final_provenance = final_paths[out_provenance.name]
-    final_stations = final_paths[out_stations.name]
-    final_metadata = final_paths[out_metadata.name]
-    final_units = final_paths[out_units.name]
-    final_schema = final_paths[out_schema.name]
-    final_sources = final_paths[out_sources.name]
-    final_manifest = final_paths[out_manifest.name]
-    final_dedup_audit = final_paths[out_dedup_audit.name]
-    final_runtime = final_paths[out_runtime.name]
-    final_raw_integrity = final_paths[out_raw_integrity.name]
     final_stats = final_paths[stats_output.name] if stats_output is not None else None
     final_qa = final_paths[qa_output.name] if qa_output is not None else None
     final_log = final_paths[log_path.name] if log_path is not None else None
@@ -2999,19 +2791,9 @@ recovery claim for a source snapshot.</div>
         "output_dir": str(out_dir),
         "csv": str(final_csv),
         "parquet": str(final_parquet),
-        "provenance": str(final_provenance),
         "statistics": str(final_stats) if final_stats else None,
         "qa_report": str(final_qa) if final_qa else None,
         "log": str(final_log) if final_log else None,
-        "stations": str(final_stations),
-        "metadata": str(final_metadata),
-        "unit_crosswalk": str(final_units),
-        "schema_crosswalk": str(final_schema),
-        "source_summary": str(final_sources),
-        "source_manifest": str(final_manifest),
-        "deduplication_audit": str(final_dedup_audit),
-        "runtime_provenance": str(final_runtime),
-        "raw_integrity": str(final_raw_integrity),
         "finalizer": selected_finalizer,
         "capacity_preflight": dict(capacity),
         "drop_counts": dict(drop_counts),
@@ -3093,12 +2875,7 @@ if __name__ == "__main__":
     print(f"Final rows : {result['final_rows']:,}")
     print(f"Output dir : {result['output_dir']}")
     print("Files:")
-    for key in [
-        "csv", "parquet", "provenance", "statistics", "qa_report", "log",
-        "stations", "metadata", "unit_crosswalk", "schema_crosswalk",
-        "source_summary", "source_manifest", "deduplication_audit",
-        "runtime_provenance", "raw_integrity",
-    ]:
+    for key in ["csv", "parquet", "statistics", "qa_report", "log"]:
         if result.get(key):
             print(f"  {key:<16}: {Path(result[key]).name}")
     print("-" * 70)
