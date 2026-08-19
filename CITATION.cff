@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use HydroStream, please cite the version-specific Zenodo record and the associated publication."
+title: "HydroStream V2.1: EA Legacy and Current API Water Quality Pipeline"
+type: software
+version: 2.1.0
+date-released: 2026-08-19
+license: CC-BY-4.0
+repository-code: "https://github.com/DomaniqueBridglalsingh/analysis-ready-wastewater-datasets"
+url: "https://github.com/DomaniqueBridglalsingh/analysis-ready-wastewater-datasets/releases/tag/v2.1.0"
+abstract: >-
+  HydroStream constructs reproducible, analysis-ready water-quality datasets
+  from Environment Agency legacy annual CSV exports and current Water Quality
+  Explorer/API CSV exports using a validated source cutover, reviewed unit
+  harmonisation, source-identity-safe deduplication, and auditable QA outputs.
+authors:
+  - family-names: Bridglalsingh
+    given-names: Domanique
+  - family-names: Abdalla
+    given-names: Ahmed
+  - family-names: Hu
+    given-names: Jia
+  - family-names: Min
+    given-names: Geyong
+  - family-names: Li
+    given-names: Xiaohong
+  - family-names: Zheng
+    given-names: Siwei
+keywords:
+  - water quality
+  - wastewater
+  - Environment Agency
+  - data harmonisation
+  - reproducible research
+  - Python
