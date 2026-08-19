@@ -1,4 +1,4 @@
-# HydroStream V2.0.0 release requirements
+# HydroStream V2.1.0 release requirements
 pandas>=2.2,<4
 numpy>=1.26,<3
 duckdb>=1.5,<2
