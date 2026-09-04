@@ -13,7 +13,7 @@
   [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21935180.svg)](https://doi.org/10.5281/zenodo.21935180)
 </div>
 
-> **Authors:** Domanique Bridglalsingh, Ahmed Abdalla, Jia Hu, Geyong Min, Xiaohong Li, and Siwei Zheng  
+> **Software authors:** Domanique Bridglalsingh and Ahmed Abdalla
 > **Websites:** [HydroStar](http://www.hydrostar-eu.com) | [University of Exeter](https://www.exeter.ac.uk)
 
 ---
